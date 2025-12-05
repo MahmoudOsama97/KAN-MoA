@@ -49,6 +49,34 @@ def main():
     parser.add_argument("--holdout_fraction", type=float, default=0.2)
     parser.add_argument("--model_save", default=None, type=int, help="Model save start step")
     parser.add_argument("--deterministic", action="store_true")
+    # KAN-MoA Arguments
+    parser.add_argument("--adapter_type", type=str, default="kan_lora", 
+                        choices=['kan_lora', 'kan_kronecker', 'pure_kan'],
+                        help="Type of experts to use")
+    
+    parser.add_argument("--num_experts", type=int, default=4)
+    
+    # Changed to String to accept lists "8,16,8,16"
+    parser.add_argument("--expert_ranks", type=str, default="8", 
+                        help="Rank (r) list. For Kronecker this is division factor (n).")
+    
+    # Changed to String to accept lists "3,5,10,20"
+    parser.add_argument("--kan_grids", type=str, default="5", 
+                        help="Grid size list for KAN experts")
+    parser.add_argument("--enable_orthogonality", type=int, default=0, 
+                        help="Enforce orthogonality between coarse and fine experts")
+    parser.add_argument("--lambda_orthogonality", type=float, default=0.1)
+
+    parser.add_argument("--injection_targets", type=str, default="qkv,proj,fc1,fc2")
+    parser.add_argument("--router_type", type=str, default="cosine", 
+                        choices=['kan', 'cosine', 'spectral'],
+                        help="Router type. 'spectral' uses FFT-based routing.")    
+    # Loss params
+    parser.add_argument("--enable_lipschitz", type=int, default=1)
+    parser.add_argument("--lambda_lipschitz", type=float, default=0.01)
+    parser.add_argument("--enable_complexity_invariance", type=int, default=1)
+    parser.add_argument("--lambda_complexity", type=float, default=1.0)
+
 
     parser.add_argument("--tb_freq", default=10)
     parser.add_argument("--debug", action="store_true", help="Run w/ debug mode")

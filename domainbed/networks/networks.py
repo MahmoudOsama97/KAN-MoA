@@ -58,6 +58,7 @@ class ResNet(torch.nn.Module):
             hparams.model,
             preserve_readout=False,
             pretrained=hparams.pretrained,
+            args=args,
             r = args.r
         )
 

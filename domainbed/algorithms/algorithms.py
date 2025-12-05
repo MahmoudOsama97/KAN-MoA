@@ -15,7 +15,11 @@ from domainbed.lib.misc import random_pairs_of_minibatches
 from domainbed.models.resnet_mixstyle import resnet18_mixstyle_L234_p0d5_a0d1, resnet50_mixstyle_L234_p0d5_a0d1
 from domainbed.models.resnet_mixstyle2 import resnet18_mixstyle2_L234_p0d5_a0d1, resnet50_mixstyle2_L234_p0d5_a0d1
 from domainbed.optimizers import get_optimizer
-
+from domainbed.models.kan_adapters import (
+    MOEKANLoraInjectedLinear, 
+    MOEKANKroneckerInjectedLinear, 
+    MOEPureKANInjectedLinear
+)
 #  import higher
 
 
@@ -1061,3 +1065,81 @@ class RSC(ERM):
         self.optimizer.step()
 
         return {"loss": loss.item()}
+
+
+class KAN_MOA(ERM):
+    """
+    Complexity-Aware KAN Mixture of Adapters
+    """
+    def __init__(self, input_shape, num_classes, num_domains, hparams, args):
+        super(KAN_MOA, self).__init__(input_shape, num_classes, num_domains, hparams, args)
+        self.args = args
+
+    def update(self, x, y, **kwargs):
+        # 1. Forward Pass
+        all_x = torch.cat(x)
+        all_y = torch.cat(y)
+        t = self.predict(all_x)
+        
+        # 2. Standard Classification Loss
+        cls_loss = F.cross_entropy(t, all_y)
+        
+        # 3. Lipschitz Loss
+        lip_loss = 0
+        ortho_loss = 0 # Idea 3 Init
+        
+        # Iterate modules once
+        adapters = [m for m in self.network.modules() 
+                   if isinstance(m, (MOEKANLoraInjectedLinear, MOEKANKroneckerInjectedLinear, MOEPureKANInjectedLinear))]
+
+        if self.args.enable_lipschitz:
+            for m in adapters:
+                lip_loss += m.get_complexity()
+
+        # 4. Orthogonality Loss (Idea 3)
+        if self.args.enable_orthogonality:
+            try:
+                for m in adapters:
+                    if hasattr(m, 'compute_orthogonality_loss'):
+                        ortho_loss += m.compute_orthogonality_loss()
+            except Exception as e:
+                print(f"\n[ERROR] Orthogonality Accumulation Failed in Algorithm.")
+                raise e
+
+        # 5. Complexity Invariance
+        comp_loss = 0
+        if self.args.enable_complexity_invariance:
+            batch_size = x[0].shape[0]
+            for m in self.network.modules():
+                if isinstance(m, (MOEKANLoraInjectedLinear, MOEKANKroneckerInjectedLinear, MOEPureKANInjectedLinear)):
+                    weights = m.last_routing_weights # (Batch*Seq, NumExperts)
+                    try:
+                        # Reshape to (NumDomains, Batch, Seq, Experts)
+                        w_domain = weights.view(len(x), batch_size, -1, m.num_experts)
+                        
+                        # Mean utilization per domain
+                        # Do domains route to experts differently on average?
+                        domain_means = w_domain.mean(dim=(1,2)) # (NumDomains, Experts)
+                        
+                        # Minimize variance between domains
+                        comp_loss += torch.var(domain_means, dim=0).sum()
+                    except:
+                        print("Warning: Could not reshape routing weights for complexity invariance loss.")
+                        
+        total_loss = cls_loss + \
+                     (self.args.lambda_lipschitz * lip_loss) + \
+                     (self.args.lambda_complexity * comp_loss) + \
+                     (self.args.lambda_orthogonality * ortho_loss)
+
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+
+        return {
+            "loss": total_loss.item(), 
+            "cls_loss": cls_loss.item(),
+            "lip_loss": lip_loss.item() if isinstance(lip_loss, torch.Tensor) else 0,
+            "comp_loss": comp_loss.item() if isinstance(comp_loss, torch.Tensor) else 0,
+            "ortho_loss": ortho_loss.item() if isinstance(ortho_loss, torch.Tensor) else 0
+        }
+        

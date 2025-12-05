@@ -4,6 +4,7 @@ import timm
 import torch
 import torch.nn as nn
 import torchvision.models
+from domainbed.models.kan_adapters import inject_kan_moe
 
 
 class Identity(nn.Module):
@@ -27,7 +28,7 @@ def torchhub_load(repo, model, **kwargs):
     return network
 
 
-def get_backbone(name, preserve_readout, pretrained, r=4):
+def get_backbone(name, preserve_readout, pretrained, args, r=4):
     # print(r)
     if not pretrained:
         assert name in ["resnet50", "swag_regnety_16gf"], "Only RN50/RegNet supports non-pretrained network"
@@ -107,7 +108,13 @@ def get_backbone(name, preserve_readout, pretrained, r=4):
             param.requires_grad = False
         require_grad_params, names = inject_trainable_moe_kronecker_new(network, r=[1, 2, 4, 8], where='every_qkv')
         setattr(network, 'require_grad_params', require_grad_params)
-
+    elif name == "nf_vitbase_moekan":
+        network = timm.create_model('vit_base_patch16_clip_224.laion2b', pretrained=True)
+        n_outputs = network.num_features
+        network.head = Identity()
+        
+        # Inject using arguments
+        network = inject_kan_moe(network, args)
     else:
         raise ValueError(name)
 
