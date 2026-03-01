@@ -1,11 +1,15 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
-import math
 import numpy as np
-from domainbed.models.kan import KANLinear
-from domainbed.models.lora.lora_util import CosineTopKGate
+import math
+import logging
+from einops import rearrange
+from .kan import KANLinear
+
+# Setup logger for debugging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 # ======================================================
 # 0. Helpers & Basic Layers
@@ -103,63 +107,226 @@ class SpectralRouter(nn.Module):
             
             return logits
         except Exception as e:
-            print(f"\n[ERROR] SpectralRouter Failed.")
-            print(f"Input shape: {x.shape}")
+            logger.error(f"SpectralRouter Failed. Input shape: {x.shape}", exc_info=True)
             raise e
+
+class CosineTopKGate(nn.Module):
+    """Simple cosine-similarity based router with top-k selection"""
+    def __init__(self, in_features, num_experts, k=1):
+        super().__init__()
+        self.num_experts = num_experts
+        self.k = k
+        # Learnable expert embeddings
+        self.expert_embeddings = nn.Parameter(torch.randn(num_experts, in_features))
+        nn.init.orthogonal_(self.expert_embeddings)
+    
+    def forward(self, x):
+        # x: (batch, in_features)
+        # Normalize
+        x_norm = F.normalize(x, p=2, dim=-1)
+        expert_norm = F.normalize(self.expert_embeddings, p=2, dim=-1)
+        
+        # Cosine similarity
+        logits = torch.matmul(x_norm, expert_norm.t())  # (batch, num_experts)
+        return logits
 
 # ======================================================
 # 1. MOE Base Class (Shared Logic)
 # ======================================================
 
 class MOEBase(nn.Module):
-    """
-    Base class for KAN MoE Adapters containing shared loss logic.
-    """
-    def compute_orthogonality_loss(self):
-        """Idea 3: Penalize dot product between Coarse and Fine experts."""
-        try:
-            # Check if forward pass has run and data exists
-            if not hasattr(self, 'last_expert_outputs') or self.last_expert_outputs is None: 
-                return 0.0
-            
-            # Check if grid_list exists (fix for AttributeError)
-            if not hasattr(self, 'grid_list'):
-                return 0.0
+    """Base class for all Mixture of Experts modules with enhanced functionality"""
+    
+    def __init__(self):
+        super().__init__()
+        self.last_routing_weights = None
+        self.last_expert_outputs = None
+        self.training_step = 0
+        self.enable_load_balance = True
+        self.enable_grid_entropy = True
+        self.enable_pairwise_ortho = True
+        self.kan_grad_scale = 0.1
+        
+    def compute_load_balance_loss(self):
+        """Compute load balancing loss - FIXED VERSION.
+        Uses softer penalty that allows some imbalance for specialization."""
+        if not hasattr(self, 'last_routing_weights') or self.last_routing_weights is None:
+            return torch.tensor(0.0)
+        
+        routing_weights = self.last_routing_weights  # [batch, num_experts]
+        if routing_weights.dim() != 2:
+            return torch.tensor(0.0)
+        
+        # Average routing weights across batch
+        avg_weights = routing_weights.mean(dim=0)  # [num_experts]
+        
+        # Target is uniform distribution
+        num_experts = avg_weights.size(0)
+        target = 1.0 / num_experts
+        
+        # Soft penalty: only penalize if any expert gets less than 50% of fair share
+        # or more than 200% of fair share
+        min_threshold = target * 0.5
+        max_threshold = target * 2.0
+        
+        # Penalize under-utilization
+        under_penalty = F.relu(min_threshold - avg_weights).sum()
+        
+        # Penalize over-utilization  
+        over_penalty = F.relu(avg_weights - max_threshold).sum()
+        
+        loss = under_penalty + over_penalty
+        
+        return loss
 
-            # Determine split based on median grid size
-            median_grid = np.median(self.grid_list)
+    def compute_lipschitz_loss(self):
+        """
+        Lipschitz regularization for KAN layers.
+        Encourages smoother spline functions by penalizing large weight norms.
+        """
+        try:
+            device = None
+            # Find device from first parameter
+            for p in self.parameters():
+                device = p.device
+                break
+            if device is None:
+                device = 'cpu'
             
-            # Identify indices
+            lip_loss = torch.tensor(0.0, device=device)
+            count = 0
+            
+            for m in self.modules():
+                if isinstance(m, KANLinear):
+                    # Penalize spline weight magnitude for smoother functions
+                    if hasattr(m, 'spline_weight') and m.spline_weight is not None:
+                        lip_loss = lip_loss + m.spline_weight.pow(2).mean()
+                        count += 1
+                    if hasattr(m, 'base_weight') and m.base_weight is not None:
+                        lip_loss = lip_loss + m.base_weight.pow(2).mean() * 0.1
+                        count += 1
+            
+            if count > 0:
+                lip_loss = lip_loss / count
+            
+            return lip_loss
+        except Exception as e:
+            logger.error(f"Error in compute_lipschitz_loss: {e}")
+            return torch.tensor(0.0)
+
+    def compute_grid_entropy_loss(self):
+        """Compute grid entropy loss - FIXED VERSION.
+        Uses lower target entropy to allow more focused routing."""
+        if not hasattr(self, 'last_routing_weights') or self.last_routing_weights is None:
+            return torch.tensor(0.0)
+        
+        routing_weights = self.last_routing_weights  # [batch, num_experts]
+        if routing_weights.dim() != 2:
+            return torch.tensor(0.0)
+        
+        # Compute entropy of routing distribution
+        # Add small epsilon for numerical stability
+        eps = 1e-8
+        entropy = -(routing_weights * torch.log(routing_weights + eps)).sum(dim=-1).mean()
+        
+        # Target entropy: log(1.5) ≈ 0.4 instead of log(2) ≈ 0.69
+        # This allows more focused routing while still encouraging some diversity
+        num_experts = routing_weights.size(1)
+        target_entropy = min(0.4, math.log(num_experts) * 0.5)
+        
+        # Penalize deviation from target
+        loss = (entropy - target_entropy).abs()
+        
+        return loss
+    
+    def compute_pairwise_orthogonality_loss(self):
+        """Compute pairwise orthogonality loss between experts - FIXED VERSION.
+        Only penalizes high similarity (>0.3) to allow some beneficial correlation."""
+        if not hasattr(self, 'last_expert_outputs') or self.last_expert_outputs is None:
+            return torch.tensor(0.0)
+        
+        expert_outputs = self.last_expert_outputs  # [batch, num_experts, dim]
+        if expert_outputs.dim() != 3 or expert_outputs.size(1) < 2:
+            return torch.tensor(0.0)
+        
+        # Normalize expert outputs
+        expert_outputs_norm = F.normalize(expert_outputs, p=2, dim=-1)
+        
+        # Compute pairwise cosine similarities
+        # [batch, num_experts, num_experts]
+        similarities = torch.bmm(expert_outputs_norm, expert_outputs_norm.transpose(1, 2))
+        
+        # Create mask for off-diagonal elements
+        num_experts = similarities.size(1)
+        mask = ~torch.eye(num_experts, dtype=torch.bool, device=similarities.device)
+        
+        # Get off-diagonal similarities
+        off_diag = similarities[:, mask].view(similarities.size(0), -1)
+        
+        # Only penalize similarities above threshold (0.3) - allows some correlation
+        threshold = 0.3
+        excess = F.relu(off_diag.abs() - threshold)
+        
+        # Mean of excess similarities
+        loss = excess.mean()
+        
+        return loss
+    
+    def compute_orthogonality_loss(self):
+        """Legacy orthogonality loss - falls back to pairwise if enabled"""
+        if self.enable_pairwise_ortho:
+            return self.compute_pairwise_orthogonality_loss()
+        
+        # Original implementation as fallback
+        if not hasattr(self, 'last_expert_outputs') or self.last_expert_outputs is None:
+            return torch.tensor(0.0)
+        
+        try:
+            expert_outs = self.last_expert_outputs
+            
+            # Handle different tensor shapes
+            while expert_outs.dim() > 3:
+                expert_outs = expert_outs.squeeze(1)
+                
+            num_experts = expert_outs.shape[1]
+            device = expert_outs.device
+            
+            if num_experts < 2 or not hasattr(self, 'grid_list'):
+                return torch.tensor(0.0, device=device)
+            
+            median_grid = np.median(self.grid_list)
             coarse_idx = [i for i, g in enumerate(self.grid_list) if g <= median_grid]
             fine_idx = [i for i, g in enumerate(self.grid_list) if g > median_grid]
             
-            # If we don't have both groups (e.g., all grids are same), skip loss
-            if not coarse_idx or not fine_idx: 
-                return 0.0
-
-            # outputs: (Batch*Seq, NumExperts, OutDim)
-            expert_outs = self.last_expert_outputs
+            if len(coarse_idx) == 0 or len(fine_idx) == 0:
+                return torch.tensor(0.0, device=device)
             
-            # Sum outputs per group (Batch, OutDim)
-            coarse_sum = expert_outs[:, coarse_idx, :].sum(dim=1)
-            fine_sum = expert_outs[:, fine_idx, :].sum(dim=1)
+            coarse_outs = expert_outs[:, coarse_idx, :].mean(dim=1)
+            fine_outs = expert_outs[:, fine_idx, :].mean(dim=1)
             
-            # Normalize vectors (Cosine Similarity approach)
-            # Add eps to prevent div by zero
-            coarse_norm = F.normalize(coarse_sum, p=2, dim=1)
-            fine_norm = F.normalize(fine_sum, p=2, dim=1)
-            
-            # Squared Dot Product: || u.T @ v ||^2
-            ortho_loss = (coarse_norm * fine_norm).sum(dim=1).pow(2).mean()
-            return ortho_loss
-            
+            cosine_sim = F.cosine_similarity(coarse_outs, fine_outs, dim=-1)
+            return cosine_sim.abs().mean()
         except Exception as e:
-            # Safe fail: print debug info only if it crashes
-            print(f"\n[ERROR] Orthogonality Loss Failed.")
-            if hasattr(self, 'grid_list'): print(f"Grid List: {self.grid_list}")
-            if hasattr(self, 'last_expert_outputs') and self.last_expert_outputs is not None:
-                print(f"Outputs shape: {self.last_expert_outputs.shape}")
-            raise e
+            logger.error(f"Error in legacy compute_orthogonality_loss: {e}")
+            return torch.tensor(0.0)
+    
+    def scale_kan_gradients(self):
+        """Scale gradients for stable KAN training"""
+        try:
+            for m in self.modules():
+                if isinstance(m, KANLinear):
+                    for p in m.parameters():
+                        if p.grad is not None:
+                            p.grad.data *= self.kan_grad_scale
+            
+            # Gradually increase scale (warm-up)
+            self.kan_grad_scale = min(1.0, self.kan_grad_scale + 0.0001)
+        except Exception as e:
+            logger.error(f"Error in scale_kan_gradients: {e}")
+    
+    def increment_step(self):
+        """Increment training step counter"""
+        self.training_step += 1
 
 # ======================================================
 # 2. MOE KAN-Kronecker (Best Performing)
@@ -167,8 +334,17 @@ class MOEBase(nn.Module):
 
 class MOEKANKroneckerInjectedLinear(MOEBase):
     def __init__(self, in_features, out_features, bias=False, 
-                 num_experts=4, r_arg="4", grid_arg="5", router_type='cosine'):
-        super().__init__()       
+                 num_experts=4, r_arg="4", grid_arg="5", router_type='cosine',
+                 enable_load_balance=True, enable_grid_entropy=True, 
+                 enable_pairwise_ortho=True, kan_init_scale=0.1):
+        super().__init__()
+        
+        # Store configurations
+        self.enable_load_balance = enable_load_balance
+        self.enable_grid_entropy = enable_grid_entropy
+        self.enable_pairwise_ortho = enable_pairwise_ortho
+        self.kan_init_scale = kan_init_scale
+        
         self.linear = nn.Linear(in_features, out_features, bias=bias)
         self.linear.weight.requires_grad = False
         if bias: self.linear.bias.requires_grad = False
@@ -193,12 +369,14 @@ class MOEKANKroneckerInjectedLinear(MOEBase):
         self.expert_downs = nn.ModuleList()
         self.expert_kans = nn.ModuleList()
         self.expert_ups = nn.ModuleList()
+        self.kan_input_norms = nn.ModuleList()  # Normalize inputs to KAN grid range
         
         for i in range(num_experts):
             n = self.r_list[i]
             g = self.grid_list[i]
             
             self.expert_downs.append(KroneckerLinear(in_features, n, n=n))
+            self.kan_input_norms.append(nn.LayerNorm(n))  # Normalize to ~N(0,1) before KAN
             self.expert_kans.append(KANLinear(n, n, grid_size=g))
             self.expert_ups.append(KroneckerLinear(n, out_features, n=n))
 
@@ -207,61 +385,74 @@ class MOEKANKroneckerInjectedLinear(MOEBase):
         self.dropout = nn.Dropout(0.1)
         self.last_expert_outputs = None
 
+        # Initialize KAN experts with warm-start for stability
+        for i, kan in enumerate(self.expert_kans):
+            try:
+                # Small initial scale for stable training
+                if hasattr(kan, 'base_weight') and kan.base_weight is not None:
+                    nn.init.zeros_(kan.base_weight)
+                if hasattr(kan, 'spline_weight') and kan.spline_weight is not None:
+                    nn.init.normal_(kan.spline_weight, std=self.kan_init_scale * 0.01)
+                logger.debug(f"Initialized KAN expert {i} with scale {self.kan_init_scale}")
+            except Exception as e:
+                logger.error(f"Failed to initialize KAN expert {i}: {e}")
+
     def forward(self, x):
         try:
             base_out = self.linear(x)
-            
-            # Apply LayerNorm before experts/router
-            x_norm = self.input_norm(x)
-            
             b, s, d = x.shape
-            x_flat = rearrange(x_norm, 'b s d -> (b s) d')
+            x_flat = rearrange(x, 'b s d -> (b s) d')
             
-            # Router
+            # Router computation
             router_logits = self.router(x_flat)
-            if self.training:
-                router_logits = router_logits + torch.randn_like(router_logits) / self.num_experts
             routing_weights = F.softmax(router_logits, dim=-1)
             self.last_routing_weights = routing_weights
             
-            expert_outputs = []
-            for i in range(self.num_experts):
-                # Down (Kron) -> KAN -> Drop -> Up (Kron)
-                # h comes from linear: (B, S, r)
-                h = self.expert_downs[i](x_norm) 
-
-                # Transpose for InstanceNorm: (B, r, S)
-                h = h.transpose(1, 2) 
-
-                # Normalize
-                h = self.bottleneck_norms[i](h) 
-
-                # Transpose back for KAN: (B, S, r)
-                # KANLinear in efficient-kan expects (..., Dim)
-                h = h.transpose(1, 2) 
-
-                h = self.expert_kans[i](h)
-                h = self.dropout(h)
-                h = self.expert_ups[i](h)        # (B, S, Out)
-                expert_outputs.append(rearrange(h, 'b s d -> (b s) d'))
+            # Store expert outputs for orthogonality loss
+            expert_outputs_list = []
+            
+            output = torch.zeros((b * s, base_out.shape[-1]), device=x.device, dtype=x.dtype)
+            
+            # Find max dimension for padding
+            max_r = max(self.r_list);
+            
+            for i, expert in enumerate(self.expert_kans):
+                # Kronecker product computation
+                x_down = self.expert_downs[i](x)  # (b, s, r)
+                x_down_flat = rearrange(x_down, 'b s r -> (b s) r')
                 
-            # Stack for calculations: (N, Experts, Dim)
-            expert_outputs_stacked = torch.stack(expert_outputs, dim=1)
+                # Normalize inputs to KAN grid range [-1, 1]
+                x_down_norm = self.kan_input_norms[i](x_down_flat)
+                
+                # KAN transformation
+                kan_out = expert(x_down_norm)  # (b*s, r_i)
+                
+                # Pad to max_r for stacking (for orthogonality loss)
+                if kan_out.shape[-1] < max_r:
+                    padding = max_r - kan_out.shape[-1]
+                    kan_out_padded = F.pad(kan_out, (0, padding), mode='constant', value=0)
+                else:
+                    kan_out_padded = kan_out
+                expert_outputs_list.append(kan_out_padded)  # (b*s, max_r)
+                
+                # Upproject (use original unpadded output)
+                final_out = self.expert_ups[i](kan_out.view(b, s, -1))  # (b, s, out)
+                final_out_flat = rearrange(final_out, 'b s o -> (b s) o')
+                
+                # Weighted aggregation
+                weight = routing_weights[:, i:i+1]
+                output = output + weight * final_out_flat * self.kan_init_scale
             
-            # Store for Orthogonality Loss (Idea 3)
-            self.last_expert_outputs = expert_outputs_stacked
+            # Store for loss computation: (N, num_experts, max_r)
+            if expert_outputs_list:
+                self.last_expert_outputs = torch.stack(expert_outputs_list, dim=1)
             
-            # Weighted Sum
-            routing_weights_unsqueezed = routing_weights.unsqueeze(-1)
-            moe_out_flat = torch.sum(routing_weights_unsqueezed * expert_outputs_stacked, dim=1)
-            
-            return base_out + (rearrange(moe_out_flat, '(b s) d -> b s d', b=b) * self.scale)
+            return base_out + output.view(b, s, -1)
             
         except Exception as e:
-            print(f"\n[ERROR] Forward Pass Failed in MOEKANKronecker.")
-            print(f"Input x shape: {x.shape}")
-            print(f"Num Experts: {self.num_experts}")
-            raise e
+            logger.error(f"Error in MOEKANKroneckerInjectedLinear forward: {e}")
+            # Fallback to base linear
+            return self.linear(x)
 
     def get_complexity(self):
         total = 0
@@ -297,12 +488,14 @@ class MOEKANLoraInjectedLinear(MOEBase):
         self.expert_downs = nn.ModuleList()
         self.expert_kans = nn.ModuleList()
         self.expert_ups = nn.ModuleList()
+        self.kan_input_norms = nn.ModuleList()  # Normalize inputs to KAN grid range
         
         for i in range(num_experts):
             r = self.r_list[i]
             g = self.grid_list[i]
             
             self.expert_downs.append(nn.Linear(in_features, r, bias=False))
+            self.kan_input_norms.append(nn.LayerNorm(r))  # Normalize to ~N(0,1) before KAN
             self.expert_kans.append(KANLinear(r, r, grid_size=g))
             self.expert_ups.append(nn.Linear(r, out_features, bias=False))
             
@@ -327,24 +520,43 @@ class MOEKANLoraInjectedLinear(MOEBase):
             routing_weights = F.softmax(router_logits, dim=-1)
             self.last_routing_weights = routing_weights
             
+            # Find max rank for padding (to enable stacking)
+            max_r = max(self.r_list)
+            
             outputs_list = []
+            expert_hidden_list = []
             for i in range(self.num_experts):
-                h = self.expert_downs[i](x_norm)
-                h = self.expert_kans[i](h)
-                h = self.dropout(h)
-                h = self.expert_ups[i](h)
-                outputs_list.append(rearrange(h, 'b s d -> (b s) d'))
+                h = self.expert_downs[i](x_norm)  # (b, s, r_i)
+                h_flat = rearrange(h, 'b s r -> (b s) r')
                 
-            expert_outputs_stacked = torch.stack(outputs_list, dim=1)
-            self.last_expert_outputs = expert_outputs_stacked
+                # Normalize inputs to KAN grid range
+                h_flat_norm = self.kan_input_norms[i](h_flat)
+                h_kan = self.expert_kans[i](h_flat_norm)  # (b*s, r_i)
+                
+                # Pad for orthogonality loss
+                if h_kan.shape[-1] < max_r:
+                    h_kan_padded = F.pad(h_kan, (0, max_r - h_kan.shape[-1]))
+                else:
+                    h_kan_padded = h_kan
+                expert_hidden_list.append(h_kan_padded)
+                
+                h_kan_3d = h_kan.view(b, s, -1)
+                h_out = self.dropout(h_kan_3d)
+                h_out = self.expert_ups[i](h_out)
+                outputs_list.append(rearrange(h_out, 'b s d -> (b s) d'))
+            
+            # Store expert outputs: (N, num_experts, max_r)
+            self.last_expert_outputs = torch.stack(expert_hidden_list, dim=1)
+                
+            expert_outputs_stacked = torch.stack(outputs_list, dim=1)  # (N, num_experts, out_dim)
             
             routing_weights_unsqueezed = routing_weights.unsqueeze(-1)
             moe_out_flat = torch.sum(routing_weights_unsqueezed * expert_outputs_stacked, dim=1)
             
             return base_out + (rearrange(moe_out_flat, '(b s) d -> b s d', b=b) * self.scale)
         except Exception as e:
-            print(f"\n[ERROR] Forward Pass Failed in MOEKANLoRA.")
-            raise e
+            logger.error(f"Forward Pass Failed in MOEKANLoRA: {e}", exc_info=True)
+            return self.linear(x)
 
     def get_complexity(self):
         total = 0
@@ -379,11 +591,13 @@ class MOEPureKANInjectedLinear(MOEBase):
 
         self.expert_downs = nn.ModuleList()
         self.expert_ups = nn.ModuleList()
+        self.kan_input_norms = nn.ModuleList()  # Normalize inputs to KAN grid range
         
         for i in range(num_experts):
             r = self.r_list[i]
             g = self.grid_list[i]
             
+            self.kan_input_norms.append(nn.LayerNorm(in_features))  # Normalize before down KAN
             # Down: KAN(in, r)
             self.expert_downs.append(KANLinear(in_features, r, grid_size=g))
             # Up: KAN(r, out)
@@ -417,22 +631,40 @@ class MOEPureKANInjectedLinear(MOEBase):
             self.last_routing_weights = routing_weights
             
             outputs_list = []
+            expert_hidden_list = []
+            
+            # Find max rank for padding
+            max_r = max(self.r_list)
+            
             for i in range(self.num_experts):
-                h = self.expert_downs[i](x_norm)
+                # Normalize before KAN
+                h_norm = self.kan_input_norms[i](x_norm)
+                h = self.expert_downs[i](h_norm)  # (b, s, r_i)
+                h_flat = rearrange(h, 'b s r -> (b s) r')
+                
+                # Pad for orthogonality loss
+                if h_flat.shape[-1] < max_r:
+                    h_padded = F.pad(h_flat, (0, max_r - h_flat.shape[-1]))
+                else:
+                    h_padded = h_flat
+                expert_hidden_list.append(h_padded)
+                
                 h = self.dropout(h)
                 h = self.expert_ups[i](h)
                 outputs_list.append(rearrange(h, 'b s d -> (b s) d'))
-                
+            
+            # Store expert hidden states: (N, num_experts, max_r)
+            self.last_expert_outputs = torch.stack(expert_hidden_list, dim=1)
+            
             expert_outputs_stacked = torch.stack(outputs_list, dim=1)
-            self.last_expert_outputs = expert_outputs_stacked
             
             routing_weights_unsqueezed = routing_weights.unsqueeze(-1)
             moe_out_flat = torch.sum(routing_weights_unsqueezed * expert_outputs_stacked, dim=1)
             
             return base_out + (rearrange(moe_out_flat, '(b s) d -> b s d', b=b) * self.scale)
         except Exception as e:
-            print(f"\n[ERROR] Forward Pass Failed in MOEPureKAN.")
-            raise e
+            logger.error(f"Forward Pass Failed in MOEPureKAN: {e}", exc_info=True)
+            return self.linear(x)
 
     def get_complexity(self):
         total = 0

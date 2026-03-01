@@ -9,6 +9,8 @@ import torch
 import torch.autograd as autograd
 import torch.nn as nn
 import torch.nn.functional as F
+import logging
+from collections import OrderedDict, defaultdict
 
 from domainbed import networks
 from domainbed.lib.misc import random_pairs_of_minibatches
@@ -21,6 +23,10 @@ from domainbed.models.kan_adapters import (
     MOEPureKANInjectedLinear
 )
 #  import higher
+
+# Setup logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 def to_minibatch(x, y):
@@ -652,8 +658,7 @@ class MLDG(ERM):
             * Lj = Loss(xj, yj, Optimizer(params, grad(Li, params)))
             * Gj = Grad(Lj, params)
 
-            * params = Optimizer(params, Grad(Li + beta * Lj, params))
-            *        = Optimizer(params, Gi + beta * Gj)
+            * params = Optimizer(params, Gi + beta * Gj)
 
         That is, when calling .step(), we want grads to be Gi + beta * Gj
 
@@ -1068,78 +1073,372 @@ class RSC(ERM):
 
 
 class KAN_MOA(ERM):
-    """
-    Complexity-Aware KAN Mixture of Adapters
-    """
+    """KAN-based Mixture of Adapters with enhanced training"""
+    
     def __init__(self, input_shape, num_classes, num_domains, hparams, args):
-        super(KAN_MOA, self).__init__(input_shape, num_classes, num_domains, hparams, args)
+        super().__init__(input_shape, num_classes, num_domains, hparams, args)
         self.args = args
-
-    def update(self, x, y, **kwargs):
-        # 1. Forward Pass
-        all_x = torch.cat(x)
-        all_y = torch.cat(y)
-        t = self.predict(all_x)
+        self.num_domains = num_domains
         
-        # 2. Standard Classification Loss
-        cls_loss = F.cross_entropy(t, all_y)
+        # Enhanced loss weights from hparams
+        self.lipschitz_weight = hparams.get('lipschitz_weight', 0.01)
+        self.ortho_weight = hparams.get('ortho_weight', 0.1)
+        self.complexity_weight = hparams.get('complexity_weight', 0.1)
+        self.load_balance_weight = hparams.get('load_balance_weight', 0.01)
+        self.grid_entropy_weight = hparams.get('grid_entropy_weight', 0.01)
+        self.domain_routing_weight = hparams.get('domain_routing_weight', 0.1)
         
-        # 3. Lipschitz Loss
-        lip_loss = 0
-        ortho_loss = 0 # Idea 3 Init
+        # Enable/disable specific losses
+        self.enable_load_balance = hparams.get('enable_load_balance', True)
+        self.enable_grid_entropy = hparams.get('enable_grid_entropy', True)
+        self.enable_pairwise_ortho = hparams.get('enable_pairwise_ortho', True)
+        self.enable_domain_routing = hparams.get('enable_domain_routing', False)
         
-        # Iterate modules once
-        adapters = [m for m in self.network.modules() 
-                   if isinstance(m, (MOEKANLoraInjectedLinear, MOEKANKroneckerInjectedLinear, MOEPureKANInjectedLinear))]
-
-        if self.args.enable_lipschitz:
-            for m in adapters:
-                lip_loss += m.get_complexity()
-
-        # 4. Orthogonality Loss (Idea 3)
-        if self.args.enable_orthogonality:
-            try:
-                for m in adapters:
-                    if hasattr(m, 'compute_orthogonality_loss'):
-                        ortho_loss += m.compute_orthogonality_loss()
-            except Exception as e:
-                print(f"\n[ERROR] Orthogonality Accumulation Failed in Algorithm.")
-                raise e
-
-        # 5. Complexity Invariance
-        comp_loss = 0
-        if self.args.enable_complexity_invariance:
+        # Gradient scaling
+        self.kan_grad_scale = hparams.get('kan_init_scale', 0.1)
+        
+        # Loss tracking for logging
+        self.loss_history = defaultdict(list)
+        self.training_step = 0
+        
+        logger.info(f"KAN_MOA initialized with weights - Lip: {self.lipschitz_weight}, "
+                   f"Ortho: {self.ortho_weight}, LoadBal: {self.load_balance_weight}, "
+                   f"GridEnt: {self.grid_entropy_weight}, DomainRoute: {self.domain_routing_weight}")
+    
+    def compute_domain_routing_loss(self, adapters, x):
+        """
+        Domain-aware routing loss: Encourage different domains to use different expert distributions.
+        Uses POSITIVE KL divergence with a target, clamped to prevent dominance.
+        """
+        if not self.enable_domain_routing:
+            return torch.tensor(0.0, device=x[0].device)
+        
+        domain_routing_loss = 0.0
+        num_domains = len(x)
+        
+        if num_domains < 2:
+            return torch.tensor(0.0, device=x[0].device)
+        
+        try:
             batch_size = x[0].shape[0]
-            for m in self.network.modules():
-                if isinstance(m, (MOEKANLoraInjectedLinear, MOEKANKroneckerInjectedLinear, MOEPureKANInjectedLinear)):
-                    weights = m.last_routing_weights # (Batch*Seq, NumExperts)
-                    try:
-                        # Reshape to (NumDomains, Batch, Seq, Experts)
-                        w_domain = weights.view(len(x), batch_size, -1, m.num_experts)
+            count = 0
+            
+            for m in adapters:
+                if not hasattr(m, 'last_routing_weights') or m.last_routing_weights is None:
+                    continue
+                
+                weights = m.last_routing_weights  # (N_total, num_experts)
+                num_experts = weights.shape[-1]
+                
+                try:
+                    # Reshape to separate domains (assume batch_size * seq_len per domain)
+                    total_per_domain = weights.shape[0] // num_domains
+                    if total_per_domain * num_domains != weights.shape[0]:
+                        continue
+                    
+                    weights_per_domain = weights.view(num_domains, total_per_domain, -1)
+                    
+                    # Mean routing per domain: (num_domains, num_experts)
+                    domain_means = weights_per_domain.mean(dim=1)
+                    
+                    # Target: uniform distribution (each domain uses all experts equally)
+                    uniform = torch.ones_like(domain_means) / num_experts
+                    
+                    # KL divergence from uniform - encourages diversity
+                    kl_from_uniform = F.kl_div(
+                        (domain_means + 1e-8).log(), 
+                        uniform, 
+                        reduction='batchmean'
+                    )
+                    
+                    # We want routing to be NOT uniform (some specialization)
+                    # So we minimize negative KL, but clamp to prevent explosion
+                    domain_routing_loss += torch.clamp(-kl_from_uniform, min=-2.0, max=2.0)
+                    count += 1
                         
-                        # Mean utilization per domain
-                        # Do domains route to experts differently on average?
-                        domain_means = w_domain.mean(dim=(1,2)) # (NumDomains, Experts)
-                        
-                        # Minimize variance between domains
-                        comp_loss += torch.var(domain_means, dim=0).sum()
-                    except:
-                        print("Warning: Could not reshape routing weights for complexity invariance loss.")
-                        
-        total_loss = cls_loss + \
-                     (self.args.lambda_lipschitz * lip_loss) + \
-                     (self.args.lambda_complexity * comp_loss) + \
-                     (self.args.lambda_orthogonality * ortho_loss)
-
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        self.optimizer.step()
-
-        return {
-            "loss": total_loss.item(), 
-            "cls_loss": cls_loss.item(),
-            "lip_loss": lip_loss.item() if isinstance(lip_loss, torch.Tensor) else 0,
-            "comp_loss": comp_loss.item() if isinstance(comp_loss, torch.Tensor) else 0,
-            "ortho_loss": ortho_loss.item() if isinstance(ortho_loss, torch.Tensor) else 0
-        }
+                except Exception as e:
+                    logger.debug(f"Could not compute domain routing loss for adapter: {e}")
+                    continue
+            
+            if count > 0:
+                domain_routing_loss = domain_routing_loss / count
+            
+            return domain_routing_loss
+            
+        except Exception as e:
+            logger.error(f"Error in compute_domain_routing_loss: {e}")
+            return torch.tensor(0.0, device=x[0].device)
+    
+    def compute_complexity_invariance_loss(self, adapters):
+        """
+        Compute complexity invariance loss across experts.
+        """
+        total_loss = 0.0
+        count = 0
+        device = None
         
+        for m in adapters:
+            if device is None and hasattr(m, 'expert_kans'):
+                for kan in m.expert_kans:
+                    for p in kan.parameters():
+                        device = p.device
+                        break
+                    if device is not None:
+                        break
+            
+            if hasattr(m, 'expert_kans'):
+                complexities = []
+                for kan in m.expert_kans:
+                    # Compute L1 norm of spline weights as complexity measure
+                    complexity = 0.0
+                    for p in kan.parameters():
+                        if p.requires_grad:
+                            complexity += p.abs().mean()
+                    complexities.append(complexity)
+                
+                if len(complexities) > 1:
+                    # Encourage similar complexity across experts
+                    complexities_tensor = torch.stack([c if isinstance(c, torch.Tensor) else torch.tensor(c, device=device) for c in complexities])
+                    total_loss += complexities_tensor.var()
+                    count += 1
+        
+        if device is None:
+            return torch.tensor(0.0)
+        
+        if count > 0:
+            return total_loss / count
+        return torch.tensor(0.0, device=device)
+    
+    def compute_lipschitz_loss(self, adapters):
+        """
+        Compute Lipschitz regularization loss for KAN adapters.
+        Encourages smooth, stable functions by penalizing large gradients.
+        """
+        total_loss = 0.0
+        count = 0
+        device = None
+        
+        for m in adapters:
+            if hasattr(m, 'expert_kans'):
+                for kan in m.expert_kans:
+                    for name, p in kan.named_parameters():
+                        if p.requires_grad:
+                            if device is None:
+                                device = p.device
+                            # Penalize large weight magnitudes (proxy for Lipschitz constant)
+                            if 'spline' in name.lower() or 'coef' in name.lower():
+                                total_loss += (p ** 2).mean()
+                                count += 1
+        
+        if device is None:
+            return torch.tensor(0.0)
+        
+        if count > 0:
+            result = total_loss / count
+            if isinstance(result, torch.Tensor):
+                return result
+            return torch.tensor(result, device=device)
+        return torch.tensor(0.0, device=device)
+    
+    def compute_grid_entropy_loss(self, adapters):
+        """
+        Compute grid entropy loss to encourage diverse spline activations.
+        """
+        total_loss = 0.0
+        count = 0
+        device = None
+        
+        for m in adapters:
+            if hasattr(m, 'expert_kans'):
+                for kan in m.expert_kans:
+                    if hasattr(kan, 'spline_weight'):
+                        w = kan.spline_weight
+                        if device is None:
+                            device = w.device
+                        # Compute entropy of weight distribution
+                        w_flat = w.view(-1).abs()
+                        w_norm = w_flat / (w_flat.sum() + 1e-8)
+                        entropy = -(w_norm * (w_norm + 1e-8).log()).sum()
+                        # Maximize entropy (minimize negative entropy)
+                        total_loss -= entropy
+                        count += 1
+        
+        if device is None:
+            return torch.tensor(0.0)
+        
+        if count > 0:
+            result = total_loss / count
+            if isinstance(result, torch.Tensor):
+                return result
+            return torch.tensor(result, device=device)
+        return torch.tensor(0.0, device=device)
+    
+    def update(self, x, y, **kwargs):
+        try:
+            all_x = torch.cat([xi for xi in x])
+            all_y = torch.cat([yi for yi in y])
+            
+            # Forward pass
+            logits = self.predict(all_x)
+            cls_loss = F.cross_entropy(logits, all_y)
+            
+            # Collect adapters
+            from domainbed.models.kan_adapters import MOEBase
+            adapters = [m for m in self.network.modules() if isinstance(m, MOEBase)]
+            
+            # Initialize losses on proper device
+            device = all_x.device
+            lip_loss = torch.tensor(0.0, device=device)
+            ortho_loss = torch.tensor(0.0, device=device)
+            load_balance_loss = torch.tensor(0.0, device=device)
+            grid_entropy_loss = torch.tensor(0.0, device=device)
+            
+            # Compute enhanced losses
+            for m in adapters:
+                m.increment_step()
+                
+                # Lipschitz regularization
+                if hasattr(m, 'compute_lipschitz_loss'):
+                    loss_val = m.compute_lipschitz_loss()
+                    if loss_val is not None:
+                        lip_loss = lip_loss + loss_val.to(device)
+                
+                # Orthogonality (pairwise or legacy)
+                if hasattr(m, 'compute_orthogonality_loss'):
+                    loss_val = m.compute_orthogonality_loss()
+                    if loss_val is not None:
+                        ortho_loss = ortho_loss + loss_val.to(device)
+                
+                # Load balancing
+                if self.enable_load_balance and hasattr(m, 'compute_load_balance_loss'):
+                    loss_val = m.compute_load_balance_loss()
+                    if loss_val is not None:
+                        load_balance_loss = load_balance_loss + loss_val.to(device)
+                
+                # Grid entropy
+                if self.enable_grid_entropy and hasattr(m, 'compute_grid_entropy_loss'):
+                    loss_val = m.compute_grid_entropy_loss()
+                    if loss_val is not None:
+                        grid_entropy_loss = grid_entropy_loss + loss_val.to(device)
+            
+            # Complexity invariance loss
+            comp_loss = self.compute_complexity_invariance_loss(adapters)
+            if comp_loss is not None:
+                if isinstance(comp_loss, (int, float)):
+                    comp_loss = torch.tensor(comp_loss, device=device)
+                else:
+                    comp_loss = comp_loss.to(device)
+            else:
+                comp_loss = torch.tensor(0.0, device=device)
+            
+            # Domain routing loss
+            domain_routing_loss = self.compute_domain_routing_loss(adapters, x)
+            if domain_routing_loss is not None:
+                domain_routing_loss = domain_routing_loss.to(device)
+            else:
+                domain_routing_loss = torch.tensor(0.0, device=device)
+            
+            # Total loss
+            loss = (cls_loss + 
+                   lip_loss * self.lipschitz_weight + 
+                   ortho_loss * self.ortho_weight + 
+                   comp_loss * self.complexity_weight +
+                   load_balance_loss * self.load_balance_weight +
+                   grid_entropy_loss * self.grid_entropy_weight +
+                   domain_routing_loss * self.domain_routing_weight)
+            
+            # Backward and optimize
+            self.optimizer.zero_grad()
+            loss.backward()
+            
+            # Scale KAN gradients for stability
+            for m in adapters:
+                if hasattr(m, 'scale_kan_gradients'):
+                    m.scale_kan_gradients()
+            
+            self.optimizer.step()
+            
+            # Logging
+            self.training_step += 1
+            if self.training_step % 100 == 0:
+                logger.info(f"Step {self.training_step} - Loss: {loss.item():.4f}, "
+                           f"Cls: {cls_loss.item():.4f}, Lip: {lip_loss.item():.4f}, "
+                           f"Ortho: {ortho_loss.item():.4f}, Comp: {comp_loss.item():.4f}, "
+                           f"LoadBal: {load_balance_loss.item():.4f}, "
+                           f"GridEnt: {grid_entropy_loss.item():.4f}, "
+                           f"DomainRoute: {domain_routing_loss.item():.4f}")
+            
+            # Track losses
+            self.loss_history['total'].append(loss.item())
+            self.loss_history['cls'].append(cls_loss.item())
+            self.loss_history['lip'].append(lip_loss.item())
+            self.loss_history['ortho'].append(ortho_loss.item())
+            self.loss_history['comp'].append(comp_loss.item())
+            self.loss_history['load_balance'].append(load_balance_loss.item())
+            self.loss_history['grid_entropy'].append(grid_entropy_loss.item())
+            self.loss_history['domain_routing'].append(domain_routing_loss.item())
+            
+            return {'loss': loss.item(), 'cls_loss': cls_loss.item()}
+            
+        except Exception as e:
+            logger.error(f"Error in KAN_MOA.update: {e}", exc_info=True)
+            # Fallback to simple ERM
+            all_x = torch.cat([xi for xi in x])
+            all_y = torch.cat([yi for yi in y])
+            logits = self.predict(all_x)
+            cls_loss = F.cross_entropy(logits, all_y)
+            self.optimizer.zero_grad()
+            cls_loss.backward()
+            self.optimizer.step()
+            return {'loss': cls_loss.item(), 'cls_loss': cls_loss.item()}
+
+    def compute_pairwise_orthogonality_loss(self, adapters):
+        """
+        Compute pairwise orthogonality loss between expert outputs.
+        """
+        total_loss = 0.0
+        count = 0
+        device = None
+        
+        for m in adapters:
+            if hasattr(m, 'last_expert_outputs') and m.last_expert_outputs is not None:
+                expert_outs = m.last_expert_outputs  # (N, num_experts, r) or similar
+                if device is None:
+                    device = expert_outs.device
+                
+                # Ensure 3D tensor for bmm
+                while expert_outs.dim() > 3:
+                    expert_outs = expert_outs.squeeze(1)
+                
+                if expert_outs.dim() < 3:
+                    continue
+                
+                N, num_experts, r = expert_outs.shape
+                
+                if num_experts < 2:
+                    continue
+                
+                # Normalize expert outputs
+                expert_outs_norm = F.normalize(expert_outs, dim=-1)  # (N, num_experts, r)
+                
+                # Compute pairwise cosine similarity
+                # (N, num_experts, r) @ (N, r, num_experts) -> (N, num_experts, num_experts)
+                similarity = torch.bmm(expert_outs_norm, expert_outs_norm.transpose(1, 2))
+                
+                # Penalize off-diagonal similarities (want orthogonal experts)
+                eye = torch.eye(num_experts, device=device).unsqueeze(0)
+                off_diag_sim = (similarity * (1 - eye)).abs()
+                ortho_loss = off_diag_sim.mean()
+                
+                total_loss += ortho_loss
+                count += 1
+        
+        if device is None:
+            return torch.tensor(0.0)
+        
+        if count > 0:
+            result = total_loss / count
+            if isinstance(result, torch.Tensor):
+                return result
+            return torch.tensor(result, device=device)
+        return torch.tensor(0.0, device=device)

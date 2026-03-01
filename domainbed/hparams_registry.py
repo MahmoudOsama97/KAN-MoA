@@ -93,6 +93,27 @@ def _hparams(algorithm, dataset, random_state):
         hparams["beta"] = (1.0, 1.0)
         # cutmix_prob is set to 1.0 for ImageNet and 0.5 for CIFAR100 in the original paper.
         hparams["cutmix_prob"] = (1.0, 1.0)
+    # KAN-MOA specific hyperparameters
+    hparams["lipschitz_weight"] = (0.001, lambda r: 0.001)
+    hparams["ortho_weight"] = (0.01, lambda r: 0.01)
+    hparams["complexity_weight"] = (0.01, lambda r: 0.01)
+    hparams["load_balance_weight"] = (0.001, lambda r: 0.001)
+    hparams["grid_entropy_weight"] = (0.001, lambda r: 0.001)
+    hparams["domain_routing_weight"] = (0.01, lambda r: 0.01)
+
+    # Enable/disable specific losses
+    hparams["enable_load_balance"] = (True, lambda r: True)
+    hparams["enable_grid_entropy"] = (True, lambda r: True)
+    hparams["enable_pairwise_ortho"] = (True, lambda r: True)
+    hparams["enable_domain_routing"] = (False, lambda r: r.choice([True, False]))
+
+    # KAN initialization
+    hparams["kan_init_scale"] = (0.1, lambda r: r.uniform(0.01, 0.5))
+    hparams["kan_grad_warmup_steps"] = (1000, lambda r: int(r.choice([500, 1000, 2000])))
+
+    # Router configuration
+    hparams["router_noise"] = (0.1, lambda r: r.uniform(0, 0.5))
+    hparams["router_temperature"] = (1.0, lambda r: r.uniform(0.5, 2.0))
 
     return hparams
 
