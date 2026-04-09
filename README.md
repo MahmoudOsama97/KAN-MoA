@@ -236,7 +236,7 @@ python analysis/routing_jsd.py --checkpoint checkpoints/pacs_best.pth --dataset 
 @inproceedings{kanmoa2026,
   title={Coarse Experts Generalize, Fine Experts Memorize: Spectral Decomposition of Adapters for Parameter-Efficient Domain Generalization},
   author={Mahmoud Soliman, Mohamed S. Shehata},
-  booktitle={DG-EBF Workshop at IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+  booktitle={IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
   year={2026}
 }
 ```
