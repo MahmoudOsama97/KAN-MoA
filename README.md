@@ -12,9 +12,6 @@
   <a href="https://arxiv.org/abs/XXXX.XXXXX"><img src="https://img.shields.io/badge/arXiv-XXXX.XXXXX-b31b1b?style=flat-square" /></a>
 </p>
 
-<p align="center">
-  <img src="figs/teaser_gradcam.png" width="100%" />
-</p>
 
 > **TL;DR** — We replace linear LoRA adapters with a mixture of KAN experts at different B-spline grid resolutions (G∈{3,5,10,20}). Low-G experts learn smooth, generalizable functions. High-G experts absorb complex domain-specific variations. A spectral router based on the FFT power spectrum of token embeddings directs tokens to experts. Result: **77.9% on DomainBed with 0.2M params**, matching 261M-param ensemble methods.
 
@@ -43,10 +40,6 @@ where E_i(x) = W_up · KAN_Gi(LN(W_down · x))    [bottleneck expert]
 ```
 
 Injected into 24 attention layers of a frozen CLIP ViT-B/16. Only 0.2M trainable parameters (0.23% of backbone).
-
-<p align="center">
-  <img src="figs/architecture.png" width="85%" />
-</p>
 
 ---
 
