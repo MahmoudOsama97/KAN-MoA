@@ -1,0 +1,17 @@
+\begin{table}[t]
+\centering
+\caption{Grid ablation study (Table~6). Mean accuracy (\%) over 3 seeds. \textbf{Bold} = best per dataset. ``Ours'' uses heterogeneous grids $G\!=\!(3,5,10,20)$.}
+\label{tab:grid_ablation_all}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcccccc}
+\toprule
+Configuration & PACS & Office-Home & VLCS & Terra Inc. & DomainNet & Avg. \\
+\midrule
+G=(3,3,3,3) & \textbf{97.7{\scriptsize±0.1}} & \textbf{89.5{\scriptsize±0.1}} & 82.6{\scriptsize±0.5} & 49.2{\scriptsize±1.9} & \textbf{62.5{\scriptsize±0.1}} & 76.3 \\
+G=(10,10,10,10) & 97.6{\scriptsize±0.2} & 89.3{\scriptsize±0.1} & \textbf{82.8{\scriptsize±0.1}} & 49.7{\scriptsize±2.9} & 62.3{\scriptsize±0.0} & 76.3 \\
+G=(20,20,20,20) & 97.5{\scriptsize±0.1} & 89.3{\scriptsize±0.1} & 82.0{\scriptsize±0.4} & 49.8{\scriptsize±1.4} & 62.5{\scriptsize±0.1} & 76.2 \\
+\textbf{G=(3,5,10,20) [Ours]} & 97.6{\scriptsize±0.1} & 89.1{\scriptsize±0.1} & 82.4{\scriptsize±0.7} & 49.2{\scriptsize±3.9} & 62.4{\scriptsize±0.1} & 76.1 \\
+G=(20,10,5,3) [Rev.] & 97.7{\scriptsize±0.1} & 89.1{\scriptsize±0.1} & 82.6{\scriptsize±0.4} & \textbf{49.9{\scriptsize±2.1}} & 62.4{\scriptsize±0.1} & \textbf{76.4} \\
+\bottomrule
+\end{tabular}}
+\end{table}

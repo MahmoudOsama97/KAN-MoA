@@ -1,23 +1,15 @@
 #!/usr/bin/env python3
 # filepath: /home/mosama97/scratch/MOKanA/analyze_logs.py
 """
-Analyze all .out log files in a folder and generate a comprehensive CSV report.
-Extracts hyperparameters, training con        if len(df) >= rows_per_env and rows_per_env > 1 and num_envs_to_use > 0:
-            # Split by test environment
-            env_dfs = []
-            for i in range(num_envs_to_use):
-                start = i * rows_per_env
-                end = start + rows_per_env
-                if start < len(df):
-                    env_df = df.iloc[start:min(end, len(df))].reset_index(drop=True)
-                    if not env_df.empty:
-                        env_dfs.append(env_df)
-            
-            if not env_dfs:
-                # Fallback: treat entire dataframe as single environment
-                env_dfs = [df]
-            
-            # Final values per environment and accuracy metrics.
+Analyze all .out log files recursively across all subdirectories and generate
+a comprehensive CSV report. Extracts hyperparameters (including G values / 
+kan_grids, expert_ranks, router_type, regularization flags, etc.), training
+metrics, and per-environment accuracy with oracle model selection.
+
+Usage:
+    python analyze_logs.py                    # recursive from current dir
+    python analyze_logs.py /path/to/repo      # recursive from given root
+    python analyze_logs.py . --no-recursive   # only top-level folder
 """
 
 import re
@@ -282,76 +274,207 @@ def analyze_domainnet_log(log_content, config):
 
 
 def extract_config_from_log(log_content):
-    """Extract configuration/hyperparameters from log content."""
+    """Extract configuration/hyperparameters from log content.
+    
+    Parses three sources in the log:
+      1. Command :: line  (the actual CLI invocation)
+      2. Args: section    (tab-indented key: value pairs)
+      3. HParams: section (tab-indented key: value pairs)
+    """
     config = {}
     
-    # Dataset
-    match = re.search(r"dataset\s*[=:]\s*(\w+)", log_content, re.IGNORECASE)
-    if match:
-        config['dataset'] = match.group(1)
+    # ===== 0. Quick check: skip logs that have no training data =====
+    if 'Args:' not in log_content and 'Command ::' not in log_content:
+        return config  # Empty / non-training log
     
-    # Algorithm
-    match = re.search(r"algorithm\s*[=:]\s*(\w+)", log_content, re.IGNORECASE)
-    if match:
-        config['algorithm'] = match.group(1)
+    # ===== 1. Parse the Command :: line for CLI arguments =====
+    cmd_match = re.search(r"Command\s*::\s*(.+)", log_content)
+    cmd_line = cmd_match.group(1).strip() if cmd_match else ""
     
-    # Test environment
-    match = re.search(r"test_env\w*\s*[=:]\s*\[?(\d+)", log_content, re.IGNORECASE)
-    if match:
-        config['test_env'] = int(match.group(1))
+    # Helper: extract --flag value from command line
+    def _cmd_val(flag):
+        m = re.search(rf"--{flag}\s+(\S+)", cmd_line)
+        return m.group(1) if m else None
     
-    # Number of steps
-    match = re.search(r"n_steps\s*[=:]\s*(\d+)", log_content)
-    if match:
-        config['n_steps'] = int(match.group(1))
+    # ===== 2. Parse Args: section (tab-indented key: value) =====
+    args_section = {}
+    args_match = re.search(r"Args:\s*\n((?:\s+\S.*\n)*)", log_content)
+    if args_match:
+        for line in args_match.group(1).split('\n'):
+            line = line.strip()
+            if ':' in line:
+                k, v = line.split(':', 1)
+                args_section[k.strip()] = v.strip()
     
-    # Learning rate
-    match = re.search(r"['\"]?lr['\"]?\s*[=:]\s*([0-9.e\-]+)", log_content)
-    if match:
+    # ===== 3. Parse HParams: section =====
+    hparams_section = {}
+    hp_match = re.search(r"HParams:\s*\n((?:\s+\S.*\n)*)", log_content)
+    if hp_match:
+        for line in hp_match.group(1).split('\n'):
+            line = line.strip()
+            if ':' in line:
+                k, v = line.split(':', 1)
+                hparams_section[k.strip()] = v.strip()
+    
+    # ===== 4. Extract fields (prefer Args section, fallback to cmd line) =====
+    
+    # --- Core identifiers ---
+    config['dataset'] = args_section.get('dataset') or _cmd_val('dataset') or ''
+    config['algorithm'] = args_section.get('algorithm') or _cmd_val('algorithm') or ''
+    
+    # Experiment name (from Args name field)
+    exp_name = args_section.get('name', '')
+    if exp_name:
+        config['experiment_name'] = exp_name
+    
+    # --- KAN grid sizes (THE critical G values) ---
+    kan_grids_raw = args_section.get('kan_grids') or _cmd_val('kan_grids') or ''
+    if kan_grids_raw:
+        config['kan_grids'] = kan_grids_raw
+        # Parse individual grid values
         try:
-            config['lr'] = float(match.group(1))
-        except:
+            g_values = [int(g) for g in kan_grids_raw.split(',')]
+            config['n_grid_values'] = len(g_values)
+            config['min_grid'] = min(g_values)
+            config['max_grid'] = max(g_values)
+            config['grid_values'] = g_values  # list for programmatic use
+            
+            # Derive grid_config type
+            if len(set(g_values)) == 1:
+                config['grid_config'] = f'uniform_{g_values[0]}'
+            elif g_values == sorted(g_values):
+                config['grid_config'] = 'hetero'  # ascending = heterogeneous (our method)
+            elif g_values == sorted(g_values, reverse=True):
+                config['grid_config'] = 'reverse'
+            else:
+                config['grid_config'] = 'custom'
+            
+            # Also try to confirm from experiment name
+            if exp_name:
+                name_lower = exp_name.lower()
+                if 'hetero' in name_lower:
+                    config['grid_config'] = 'hetero'
+                elif 'reverse' in name_lower or 'rev' in name_lower:
+                    config['grid_config'] = 'reverse'
+                elif 'uniform' in name_lower:
+                    config['grid_config'] = f'uniform_{g_values[0]}'
+        except (ValueError, TypeError):
+            config['grid_config'] = 'unknown'
+    
+    # --- Expert ranks ---
+    expert_ranks_raw = args_section.get('expert_ranks') or _cmd_val('expert_ranks') or ''
+    if expert_ranks_raw:
+        config['expert_ranks'] = expert_ranks_raw
+        try:
+            r_values = [int(r) for r in expert_ranks_raw.split(',')]
+            config['rank_values'] = r_values
+            config['min_rank'] = min(r_values)
+            config['max_rank'] = max(r_values)
+        except (ValueError, TypeError):
             pass
     
-    # Batch size
-    match = re.search(r"batch_size\s*[=:]\s*(\d+)", log_content)
-    if match:
-        config['batch_size'] = int(match.group(1))
-    
-    # Weight decay
-    match = re.search(r"weight_decay\s*[=:]\s*([0-9.e\-]+)", log_content)
-    if match:
+    # --- Number of experts ---
+    ne = args_section.get('num_experts') or _cmd_val('num_experts')
+    if ne:
         try:
-            config['weight_decay'] = float(match.group(1))
-        except:
+            config['num_experts'] = int(ne)
+        except ValueError:
             pass
     
-    # KAN-MOA specific parameters
+    # --- Adapter type ---
+    config['adapter_type'] = args_section.get('adapter_type') or _cmd_val('adapter_type') or ''
+    
+    # --- Router type ---
+    config['router_type'] = args_section.get('router_type') or _cmd_val('router_type') or ''
+    
+    # --- Injection targets ---
+    config['injection_targets'] = args_section.get('injection_targets') or _cmd_val('injection_targets') or ''
+    
+    # --- Model ---
+    config['model'] = args_section.get('model') or _cmd_val('model') or ''
+    
+    # --- Seed ---
+    seed_val = args_section.get('seed') or _cmd_val('seed')
+    if seed_val:
+        try:
+            config['seed'] = int(seed_val)
+        except ValueError:
+            pass
+    
+    # --- Steps ---
+    steps_val = args_section.get('steps') or _cmd_val('steps')
+    if steps_val:
+        try:
+            config['n_steps'] = int(steps_val)
+        except ValueError:
+            pass
+    
+    # --- Regularization flags (from Args) ---
+    for flag in ['enable_orthogonality', 'enable_lipschitz', 'enable_complexity_invariance']:
+        val = args_section.get(flag) or _cmd_val(flag)
+        if val is not None:
+            try:
+                config[flag] = int(val)
+            except ValueError:
+                config[flag] = 1 if val.lower() in ('true', '1') else 0
+    
+    # --- Lambda values (from Args) ---
+    for lam in ['lambda_orthogonality', 'lambda_lipschitz', 'lambda_complexity']:
+        val = args_section.get(lam) or _cmd_val(lam)
+        if val:
+            try:
+                config[lam] = float(val)
+            except ValueError:
+                pass
+    
+    # --- l_aux flag ---
+    l_aux_val = args_section.get('l_aux')
+    if l_aux_val is not None:
+        config['l_aux'] = l_aux_val.strip() == 'True'
+    
+    # ===== 5. HParams section (training hyperparameters) =====
+    # Learning rate, batch_size, weight_decay
+    for hp_key, config_key in [('lr', 'lr'), ('batch_size', 'batch_size'), ('weight_decay', 'weight_decay')]:
+        val = hparams_section.get(hp_key)
+        if val:
+            try:
+                config[config_key] = float(val) if '.' in val or 'e' in val.lower() else int(val)
+            except ValueError:
+                pass
+    
+    # KAN-MOA loss weights
     for param in ['lipschitz_weight', 'ortho_weight', 'complexity_weight', 
                   'load_balance_weight', 'grid_entropy_weight', 'domain_routing_weight']:
-        match = re.search(rf"['\"]?{param}['\"]?\s*[=:]\s*([0-9.e\-]+)", log_content)
-        if match:
+        val = hparams_section.get(param)
+        if val:
             try:
-                config[param] = float(match.group(1))
-            except:
+                config[param] = float(val)
+            except ValueError:
                 pass
     
     # Feature toggles
     for toggle in ['enable_load_balance', 'enable_grid_entropy', 'enable_pairwise_ortho', 'enable_domain_routing']:
-        match = re.search(rf"['\"]?{toggle}['\"]?\s*[=:]\s*(True|False|true|false|1|0)", log_content)
-        if match:
-            val = match.group(1).lower()
-            config[toggle] = val in ['true', '1']
+        val = hparams_section.get(toggle)
+        if val is not None:
+            config[toggle] = val.strip().lower() in ('true', '1')
     
-    # Model
-    match = re.search(r"model\s*[=:]\s*['\"]?(\S+)['\"]?", log_content)
-    if match:
-        config['model'] = match.group(1).strip("'\"")
+    # KAN-specific HParams
+    for hp in ['kan_init_scale', 'kan_grad_warmup_steps', 'router_noise', 'router_temperature']:
+        val = hparams_section.get(hp)
+        if val:
+            try:
+                config[hp] = float(val)
+            except ValueError:
+                pass
     
-    # Seed
-    match = re.search(r"seed\s*[=:]\s*(\d+)", log_content)
+    # ===== 6. Parameter counts =====
+    match = re.search(r"# of params\s*=\s*(\d+)", log_content)
     if match:
-        config['seed'] = int(match.group(1))
+        config['total_params'] = int(match.group(1))
+    
+    match = re.search(r"# of trainable params\s*=\s*(\d+)", log_content)
+    if match:
+        config['trainable_params'] = int(match.group(1))
     
     return config
 
@@ -438,12 +561,20 @@ def extract_table_data(log_content, dataset=None):
     return df
 
 
-def analyze_single_log(log_filepath):
+def analyze_single_log(log_filepath, root_folder=None):
     """Analyze a single log file and return metrics."""
     result = {
         'filepath': str(log_filepath),
         'filename': os.path.basename(log_filepath),
     }
+    
+    # Add subfolder relative to root
+    if root_folder:
+        try:
+            rel = os.path.relpath(os.path.dirname(log_filepath), root_folder)
+            result['subfolder'] = rel if rel != '.' else '(root)'
+        except ValueError:
+            result['subfolder'] = os.path.dirname(str(log_filepath))
     
     try:
         with open(log_filepath, 'r') as f:
@@ -452,8 +583,19 @@ def analyze_single_log(log_filepath):
         result['error'] = str(e)
         return result
     
+    # Skip empty or very short files (no training data)
+    if len(log_content.strip()) < 100:
+        result['error'] = 'Empty or too short'
+        return result
+    
     # Extract configuration
     config = extract_config_from_log(log_content)
+    
+    # Skip files that have no meaningful config (e.g. just CUDA info)
+    if not config.get('dataset') and not config.get('algorithm'):
+        result['error'] = 'No training config found (not a training log)'
+        return result
+    
     result.update(config)
     
     # For DomainNet, use the specialized analyzer
@@ -625,40 +767,72 @@ def analyze_single_log(log_filepath):
     return result
 
 
-def analyze_folder(folder_path, pattern="*.out", recursive=False):
-    """Analyze all log files in a folder."""
-    folder = Path(folder_path)
+def analyze_folder(folder_path, pattern="*.out", recursive=True, skip_non_training=True):
+    """Analyze all log files in a folder (recursively by default)."""
+    folder = Path(folder_path).resolve()
     
     if not folder.exists():
         print(f"Error: Folder not found: {folder_path}")
         return pd.DataFrame()
     
-    # Find all matching files, skip dcgm_*.out
+    # Find all matching files, skip dcgm_*.out and analysis_*.out and error_*.out
+    skip_prefixes = ('dcgm_', 'analysis_', 'error_')
     if recursive:
-        files = [f for f in folder.rglob(pattern) if not f.name.startswith('dcgm_')]
+        files = [f for f in folder.rglob(pattern) if not any(f.name.startswith(p) for p in skip_prefixes)]
     else:
-        files = [f for f in folder.glob(pattern) if not f.name.startswith('dcgm_')]
+        files = [f for f in folder.glob(pattern) if not any(f.name.startswith(p) for p in skip_prefixes)]
     
     if not files:
         print(f"No files matching '{pattern}' found in {folder_path}")
         return pd.DataFrame()
     
-    print(f"Found {len(files)} log files to analyze...")
+    # Sort files for deterministic ordering
+    files.sort(key=lambda f: str(f))
+    
+    print(f"Found {len(files)} log files to analyze across {len(set(f.parent for f in files))} directories...")
     
     results = []
+    skipped = 0
     for i, filepath in enumerate(files):
-        print(f"  [{i+1}/{len(files)}] Processing: {filepath.name}")
-        result = analyze_single_log(filepath)
+        rel_path = filepath.relative_to(folder) if filepath.is_relative_to(folder) else filepath
+        print(f"  [{i+1}/{len(files)}] {rel_path}")
+        result = analyze_single_log(filepath, root_folder=str(folder))
+        
+        # Optionally skip non-training logs from the final results
+        if skip_non_training and result.get('error') == 'No training config found (not a training log)':
+            skipped += 1
+            continue
+        if skip_non_training and result.get('error') == 'Empty or too short':
+            skipped += 1
+            continue
+        
         results.append(result)
+    
+    if skipped:
+        print(f"  (Skipped {skipped} non-training/empty files)")
+    
+    if not results:
+        print("No valid training logs found.")
+        return pd.DataFrame()
     
     df = pd.DataFrame(results)
     
-    # Reorder columns for better readability
+    # Reorder columns for better readability — grid info is prominent
     priority_cols = [
-        'filename', 'dataset', 'algorithm', 'test_env',
+        'filename', 'subfolder', 'dataset', 'algorithm', 'experiment_name',
+        'grid_config', 'kan_grids', 'n_grid_values', 'min_grid', 'max_grid',
         'best_acc', 'avg_final_test_in', 'avg_best_trainout_testin', 'avg_best_troutloss_testin',
         'std_final_test_in',
-        'lr', 'batch_size', 'n_steps', 'seed',
+        'adapter_type', 'num_experts', 'expert_ranks', 'min_rank', 'max_rank',
+        'router_type', 'injection_targets',
+        'trainable_params', 'total_params',
+        'enable_orthogonality', 'enable_lipschitz', 'enable_complexity_invariance',
+        'lambda_orthogonality', 'lambda_lipschitz', 'lambda_complexity',
+        'enable_load_balance', 'enable_grid_entropy', 'enable_pairwise_ortho', 'enable_domain_routing',
+        'lipschitz_weight', 'ortho_weight', 'complexity_weight',
+        'load_balance_weight', 'grid_entropy_weight', 'domain_routing_weight',
+        'kan_init_scale', 'kan_grad_warmup_steps', 'router_noise', 'router_temperature',
+        'lr', 'batch_size', 'weight_decay', 'n_steps', 'seed', 'model',
     ]
     
     # Put priority columns first, then the rest
@@ -671,32 +845,37 @@ def analyze_folder(folder_path, pattern="*.out", recursive=False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Analyze .out log files and generate a CSV report with metrics and hyperparameters.',
+        description='Analyze .out log files recursively and generate a CSV report with metrics and hyperparameters.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Analyze all .out files in current directory
+  # Analyze all .out files recursively from current directory (DEFAULT)
   python analyze_logs.py .
   
   # Analyze specific folder and save to custom CSV
-  python analyze_logs.py /path/to/logs --output my_results.csv
+  python analyze_logs.py /path/to/repo --output my_results.csv
   
-  # Analyze recursively
-  python analyze_logs.py /path/to/logs --recursive
+  # Analyze only top-level directory (no recursion)
+  python analyze_logs.py /path/to/repo --no-recursive
   
   # Analyze only files matching a pattern
-  python analyze_logs.py /path/to/logs --pattern "output_*.out"
+  python analyze_logs.py /path/to/logs --pattern "exp1_*.out"
+  
+  # Include non-training logs (e.g. empty files, CUDA-only logs)
+  python analyze_logs.py . --include-all
 """
     )
     
     parser.add_argument('folder', type=str, nargs='?', default='.',
-                       help='Folder containing .out log files (default: current directory)')
+                       help='Root folder to search for .out log files (default: current directory)')
     parser.add_argument('--output', '-o', type=str, default='log_analysis_results.csv',
                        help='Output CSV file path (default: log_analysis_results.csv)')
     parser.add_argument('--pattern', '-p', type=str, default='*.out',
                        help='File pattern to match (default: *.out)')
-    parser.add_argument('--recursive', '-r', action='store_true',
-                       help='Search recursively in subdirectories')
+    parser.add_argument('--no-recursive', action='store_true',
+                       help='Only search top-level folder (default: recursive)')
+    parser.add_argument('--include-all', action='store_true',
+                       help='Include non-training logs in output (empty, CUDA-only, etc.)')
     parser.add_argument('--sort-by', '-s', type=str, default='avg_best_trainout_testin',
                        help='Column to sort results by (default: avg_best_trainout_testin)')
     parser.add_argument('--descending', '-d', action='store_true', default=True,
@@ -706,17 +885,20 @@ Examples:
     
     args = parser.parse_args()
     
+    recursive = not args.no_recursive
+    
     print(f"\n{'='*80}")
     print("LOG ANALYSIS TOOL")
     print(f"{'='*80}")
-    print(f"Folder: {args.folder}")
+    print(f"Folder: {os.path.abspath(args.folder)}")
     print(f"Pattern: {args.pattern}")
-    print(f"Recursive: {args.recursive}")
+    print(f"Recursive: {recursive}")
     print(f"Output: {args.output}")
     print(f"{'='*80}\n")
     
     # Analyze folder
-    df = analyze_folder(args.folder, args.pattern, args.recursive)
+    df = analyze_folder(args.folder, args.pattern, recursive=recursive,
+                       skip_non_training=not args.include_all)
     
     if df.empty:
         print("No results to save.")
@@ -726,8 +908,12 @@ Examples:
     if args.sort_by in df.columns:
         df = df.sort_values(by=args.sort_by, ascending=not args.descending, na_position='last')
     
+    # Drop internal list columns before saving to CSV
+    drop_cols = [c for c in ['grid_values', 'rank_values'] if c in df.columns]
+    df_save = df.drop(columns=drop_cols, errors='ignore')
+    
     # Save to CSV
-    df.to_csv(args.output, index=False)
+    df_save.to_csv(args.output, index=False)
     print(f"\n✓ Results saved to: {args.output}")
     
     # Print summary
@@ -750,17 +936,34 @@ Examples:
     print(f"TOP {args.show_top} RESULTS")
     print(f"{'='*80}")
     
-    display_cols = ['filename']
-    for col in ['dataset', 'algorithm', 'best_acc', 'avg_best_trainout_testin', 'avg_final_test_in', 'lr', 'seed']:
+    display_cols = ['filename', 'subfolder']
+    for col in ['dataset', 'algorithm', 'grid_config', 'kan_grids',
+                'best_acc', 'avg_best_trainout_testin', 'avg_final_test_in',
+                'adapter_type', 'num_experts', 'expert_ranks',
+                'router_type', 'injection_targets',
+                'trainable_params', 'lr', 'seed']:
         if col in df.columns:
             display_cols.append(col)
     
-    top_df = df.head(args.show_top)[display_cols]
+    top_df = df.head(args.show_top)[display_cols].copy()
     
     # Format percentages
     for col in top_df.columns:
-        if 'test' in col.lower():
+        if 'test' in col.lower() or col == 'best_acc':
             top_df[col] = top_df[col].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else "N/A")
+    
+    # Format trainable_params as human-readable
+    if 'trainable_params' in top_df.columns:
+        def _fmt_params(x):
+            if pd.isna(x) or not x:
+                return "N/A"
+            x = int(x)
+            if x >= 1_000_000:
+                return f"{x/1_000_000:.2f}M"
+            elif x >= 1_000:
+                return f"{x/1_000:.1f}K"
+            return str(x)
+        top_df['trainable_params'] = top_df['trainable_params'].apply(_fmt_params)
     
     print(top_df.to_string(index=False))
     print(f"\n{'='*80}")
@@ -768,8 +971,9 @@ Examples:
     # --- Custom summary: Highest best_acc per dataset and their average ---
     datasets = ['PACS', 'OfficeHome', 'VLCS', 'TerraIncognita', 'DomainNet']
     best_accs = []
+    best_rows = {}
     print(f"\n{'='*80}")
-    print("HIGHEST best_acc PER DATASET")
+    print("HIGHEST best_acc PER DATASET (with method config & trainable params)")
     print(f"{'='*80}")
     for ds in datasets:
         ds_df = df[df['dataset'] == ds]
@@ -777,17 +981,99 @@ Examples:
             # For DomainNet, handle possible missing/NaN best_acc
             ds_df = ds_df[pd.notnull(ds_df['best_acc'])]
             if not ds_df.empty:
-                max_acc = ds_df['best_acc'].max()
+                best_idx = ds_df['best_acc'].idxmax()
+                best_row = ds_df.loc[best_idx]
+                max_acc = best_row['best_acc']
                 best_accs.append(max_acc)
-                print(f"{ds:15s}: {max_acc:.2f}%")
+                best_rows[ds] = best_row
+                
+                # Format trainable params
+                train_p = best_row.get('trainable_params', None)
+                total_p = best_row.get('total_params', None)
+                if pd.notna(train_p) and train_p:
+                    train_p = int(train_p)
+                    if train_p >= 1_000_000:
+                        param_str = f"{train_p/1_000_000:.2f}M"
+                    elif train_p >= 1_000:
+                        param_str = f"{train_p/1_000:.1f}K"
+                    else:
+                        param_str = str(train_p)
+                else:
+                    param_str = "N/A"
+                    
+                if pd.notna(total_p) and total_p:
+                    total_p = int(total_p)
+                    if total_p >= 1_000_000:
+                        total_str = f"{total_p/1_000_000:.2f}M"
+                    else:
+                        total_str = str(total_p)
+                else:
+                    total_str = "N/A"
+                
+                # Method config
+                adapter = best_row.get('adapter_type', 'N/A') if pd.notna(best_row.get('adapter_type', None)) else 'N/A'
+                n_exp = best_row.get('num_experts', 'N/A') if pd.notna(best_row.get('num_experts', None)) else 'N/A'
+                ranks = best_row.get('expert_ranks', 'N/A') if pd.notna(best_row.get('expert_ranks', None)) else 'N/A'
+                grids = best_row.get('kan_grids', 'N/A') if pd.notna(best_row.get('kan_grids', None)) else 'N/A'
+                grid_cfg = best_row.get('grid_config', 'N/A') if pd.notna(best_row.get('grid_config', None)) else 'N/A'
+                router = best_row.get('router_type', 'N/A') if pd.notna(best_row.get('router_type', None)) else 'N/A'
+                targets = best_row.get('injection_targets', 'N/A') if pd.notna(best_row.get('injection_targets', None)) else 'N/A'
+                subfld = best_row.get('subfolder', 'N/A') if pd.notna(best_row.get('subfolder', None)) else 'N/A'
+                fname = best_row.get('filename', 'N/A')
+                
+                print(f"\n  {ds}:")
+                print(f"    Accuracy:          {max_acc:.2f}%")
+                print(f"    Grid Config:       {grid_cfg} (G={grids})")
+                print(f"    Trainable Params:  {param_str} / {total_str} total")
+                print(f"    Adapter Type:      {adapter}")
+                print(f"    Num Experts:       {n_exp}")
+                print(f"    Expert Ranks:      {ranks}")
+                print(f"    Router Type:       {router}")
+                print(f"    Injection Targets: {targets}")
+                print(f"    Subfolder:         {subfld}")
+                print(f"    Log File:          {fname}")
             else:
-                print(f"{ds:15s}: N/A")
+                print(f"\n  {ds}: N/A")
         else:
-            print(f"{ds:15s}: N/A")
+            print(f"\n  {ds}: N/A")
+    
     if best_accs:
         avg_acc = np.mean(best_accs)
-        print(f"{'-'*80}")
+        print(f"\n{'-'*80}")
         print(f"Average of bests: {avg_acc:.2f}%")
+        
+        # Summary table of trainable params per dataset
+        print(f"\n{'-'*80}")
+        print(f"{'Dataset':15s} | {'Best Acc':>10s} | {'Grid Config':>14s} | {'Trainable Params':>18s} | {'Total Params':>14s} | {'Config':s}")
+        print(f"{'-'*15}-+-{'-'*10}-+-{'-'*14}-+-{'-'*18}-+-{'-'*14}-+-{'-'*30}")
+        for ds in datasets:
+            if ds in best_rows:
+                row = best_rows[ds]
+                acc = row['best_acc']
+                tp = row.get('trainable_params', None)
+                total = row.get('total_params', None)
+                
+                if pd.notna(tp) and tp:
+                    tp_int = int(tp)
+                    tp_str = f"{tp_int:,}"
+                else:
+                    tp_str = "N/A"
+                
+                if pd.notna(total) and total:
+                    total_str = f"{int(total):,}"
+                else:
+                    total_str = "N/A"
+                
+                adapter = row.get('adapter_type', '?') if pd.notna(row.get('adapter_type', None)) else '?'
+                grids = row.get('kan_grids', '?') if pd.notna(row.get('kan_grids', None)) else '?'
+                grid_cfg = row.get('grid_config', '?') if pd.notna(row.get('grid_config', None)) else '?'
+                router = row.get('router_type', '?') if pd.notna(row.get('router_type', None)) else '?'
+                config_str = f"{adapter} g={grids} ({grid_cfg}) r={router}"
+                
+                print(f"{ds:15s} | {acc:9.2f}% | {grid_cfg:>14s} | {tp_str:>18s} | {total_str:>14s} | {config_str}")
+            else:
+                print(f"{ds:15s} | {'N/A':>10s} | {'N/A':>14s} | {'N/A':>18s} | {'N/A':>14s} | N/A")
+    
     print(f"{'='*80}\n")
 
 

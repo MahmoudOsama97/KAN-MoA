@@ -1,0 +1,167 @@
+{
+  "uniform_3": {
+    "label": "G=(3,3,3,3)",
+    "PACS": {
+      "mean": 97.75,
+      "std": 0.09,
+      "n": 3
+    },
+    "OfficeHome": {
+      "mean": 89.52,
+      "std": 0.1,
+      "n": 3
+    },
+    "VLCS": {
+      "mean": 82.63,
+      "std": 0.51,
+      "n": 3
+    },
+    "TerraIncognita": {
+      "mean": 49.18,
+      "std": 1.87,
+      "n": 3
+    },
+    "DomainNet": {
+      "mean": 62.48,
+      "std": 0.06,
+      "n": 3
+    },
+    "Avg": {
+      "mean": 76.31,
+      "std": null,
+      "n": 5
+    }
+  },
+  "uniform_10": {
+    "label": "G=(10,10,10,10)",
+    "PACS": {
+      "mean": 97.57,
+      "std": 0.23,
+      "n": 3
+    },
+    "OfficeHome": {
+      "mean": 89.28,
+      "std": 0.15,
+      "n": 3
+    },
+    "VLCS": {
+      "mean": 82.78,
+      "std": 0.11,
+      "n": 3
+    },
+    "TerraIncognita": {
+      "mean": 49.71,
+      "std": 2.95,
+      "n": 3
+    },
+    "DomainNet": {
+      "mean": 62.35,
+      "std": 0.04,
+      "n": 3
+    },
+    "Avg": {
+      "mean": 76.34,
+      "std": null,
+      "n": 5
+    }
+  },
+  "uniform_20": {
+    "label": "G=(20,20,20,20)",
+    "PACS": {
+      "mean": 97.5,
+      "std": 0.06,
+      "n": 3
+    },
+    "OfficeHome": {
+      "mean": 89.31,
+      "std": 0.07,
+      "n": 3
+    },
+    "VLCS": {
+      "mean": 81.96,
+      "std": 0.39,
+      "n": 3
+    },
+    "TerraIncognita": {
+      "mean": 49.82,
+      "std": 1.4,
+      "n": 3
+    },
+    "DomainNet": {
+      "mean": 62.47,
+      "std": 0.09,
+      "n": 3
+    },
+    "Avg": {
+      "mean": 76.21,
+      "std": null,
+      "n": 5
+    }
+  },
+  "hetero": {
+    "label": "G=(3,5,10,20) [Ours]",
+    "PACS": {
+      "mean": 97.58,
+      "std": 0.11,
+      "n": 3
+    },
+    "OfficeHome": {
+      "mean": 89.15,
+      "std": 0.08,
+      "n": 3
+    },
+    "VLCS": {
+      "mean": 82.37,
+      "std": 0.75,
+      "n": 3
+    },
+    "TerraIncognita": {
+      "mean": 49.18,
+      "std": 3.85,
+      "n": 3
+    },
+    "DomainNet": {
+      "mean": 62.38,
+      "std": 0.07,
+      "n": 3
+    },
+    "Avg": {
+      "mean": 76.13,
+      "std": null,
+      "n": 5
+    }
+  },
+  "reverse": {
+    "label": "G=(20,10,5,3) [Rev.]",
+    "PACS": {
+      "mean": 97.68,
+      "std": 0.06,
+      "n": 3
+    },
+    "OfficeHome": {
+      "mean": 89.15,
+      "std": 0.05,
+      "n": 3
+    },
+    "VLCS": {
+      "mean": 82.62,
+      "std": 0.39,
+      "n": 3
+    },
+    "TerraIncognita": {
+      "mean": 49.94,
+      "std": 2.11,
+      "n": 3
+    },
+    "DomainNet": {
+      "mean": 62.38,
+      "std": 0.07,
+      "n": 3
+    },
+    "Avg": {
+      "mean": 76.35,
+      "std": null,
+      "n": 5
+    }
+  }
+}
